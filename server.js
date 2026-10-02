@@ -10,7 +10,12 @@
 //                      {type:"join", room:"BONE-7K2Q"}       join a room
 //                      {type:"relay", to:<id>, data:{...}}   forward an offer/answer/candidate
 //                      {type:"ping"}
-//   server -> client   {type:"hosted", room, id:1}
+//                      {type:"presence", name, ver}          "I am online" (counts towards players online)
+//                      {type:"list"}                         ask for the public parties
+//                      {type:"set_public", public, info}     host: list / unlist this room, with its details
+//   server -> client   {type:"online", count}                players online (sent on presence + whenever it changes)
+//                      {type:"rooms", rooms:[{room,name,mode,arena,players,max,ver}]}
+//                         {type:"hosted", room, id:1}
 //                      {type:"joined", room, id}             (id >= 2)
 //                      {type:"peer_joined", id}              (to the host)
 //                      {type:"peer_left", id}                (to the host)
@@ -30,6 +35,24 @@ const ROOM_MAX_AGE_MS = parseInt(process.env.ROOM_MAX_AGE_HOURS || "12", 10) * 3
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "120", 10);       // messages per 10 s per connection
 const ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";                   // no 0/O/1/I
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+const MAX_PRESENCE = parseInt(process.env.MAX_PRESENCE || "3000", 10);
+const PRESENCE_IDLE_MS = parseInt(process.env.PRESENCE_IDLE_SECONDS || "120", 10) * 1000;
+const presence = new Set();    // connections that said "presence": every running copy of the game
+let onlineTimer = null;
+
+function scheduleOnlineBroadcast() {
+  if (onlineTimer) return;
+  onlineTimer = setTimeout(() => {
+    onlineTimer = null;
+    const n = presence.size;
+    for (const c of presence) c.send({ type: "online", count: n });
+  }, 1500);
+}
+
+function clean(v, max) {
+  return String(v === undefined || v === null ? "" : v).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, max);
+}
 
 const rooms = new Map();       // code -> {host: Client, peers: Map<id, Client>, created: number, nextId: number}
 
@@ -58,6 +81,8 @@ class Client {
     this.id = 0;
     this.isHost = false;
     this.msgTimes = [];
+    this.presence = false;
+    this.lastSeen = Date.now();
     socket.on("data", (d) => this.onData(d));
     socket.on("close", () => this.onClose());
     socket.on("error", () => this.onClose());
@@ -140,6 +165,7 @@ class Client {
 
   onMessage(text) {
     const now = Date.now();
+    this.lastSeen = now;
     this.msgTimes = this.msgTimes.filter((t) => now - t < 10000);
     this.msgTimes.push(now);
     if (this.msgTimes.length > RATE_LIMIT) { this.send({ type: "error", code: "rate_limited" }); return; }
@@ -163,12 +189,43 @@ function handle(c, m) {
     case "ping":
       c.send({ type: "pong" });
       return;
+    case "presence": {
+      if (c.room) { c.send({ type: "error", code: "bad_message" }); return; }
+      if (!presence.has(c) && presence.size >= MAX_PRESENCE) { c.send({ type: "error", code: "busy" }); return; }
+      presence.add(c);
+      c.presence = true;
+      c.send({ type: "online", count: presence.size });
+      scheduleOnlineBroadcast();
+      return;
+    }
+    case "list": {
+      const out = [];
+      for (const [code, room] of rooms) {
+        if (!room.public || !room.info || room.info.phase !== "lobby") continue;
+        const players = room.peers.size + 1;
+        if (players >= MAX_PLAYERS) continue;
+        out.push({ room: code, name: room.info.name, mode: room.info.mode, arena: room.info.arena,
+                   players: players, max: MAX_PLAYERS, ver: room.info.ver });
+      }
+      out.sort((a, b) => b.players - a.players);
+      c.send({ type: "rooms", rooms: out.slice(0, 40) });
+      return;
+    }
+    case "set_public": {
+      const room = c.room ? rooms.get(c.room) : null;
+      if (!room || !c.isHost) { c.send({ type: "error", code: "bad_message" }); return; }
+      const i = m.info || {};
+      room.public = m.public === true;
+      room.info = { name: clean(i.name, 24) || "Party", mode: clean(i.mode, 12), arena: clean(i.arena, 12),
+                    phase: clean(i.phase, 8), ver: clean(i.ver, 16) };
+      return;
+    }
     case "host": {
       if (c.room) { c.send({ type: "error", code: "bad_message" }); return; }
       if (rooms.size >= MAX_ROOMS) { c.send({ type: "error", code: "busy" }); return; }
       const code = makeCode();
       if (!code) { c.send({ type: "error", code: "busy" }); return; }
-      rooms.set(code, { host: c, peers: new Map(), created: Date.now(), nextId: 2 });
+      rooms.set(code, { host: c, peers: new Map(), created: Date.now(), nextId: 2, public: false, info: null });
       c.room = code; c.id = 1; c.isHost = true;
       log("room created", code, "(rooms:", rooms.size + ")");
       c.send({ type: "hosted", room: code, id: 1 });
@@ -206,6 +263,11 @@ function handle(c, m) {
 }
 
 function leave(c) {
+  if (c.presence) {
+    c.presence = false;
+    presence.delete(c);
+    scheduleOnlineBroadcast();
+  }
   if (!c.room) return;
   const room = rooms.get(c.room);
   const code = c.room;
@@ -235,13 +297,16 @@ setInterval(() => {
       room.host.close(1000);
     }
   }
-}, 60000).unref();
+  for (const c of presence) {
+    if (now - c.lastSeen > PRESENCE_IDLE_MS) { log("presence timed out"); c.close(1000); }
+  }
+}, 30000).unref();
 
 // ----------------------------------------------------------------------------- HTTP + upgrade
 const server = http.createServer((req, res) => {
   // health check (Render / Fly.io probes, and a human poking it with a browser)
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Skeletoings signaling server: ok (" + rooms.size + " rooms)\n");
+  res.end("Skeletoings signaling server: ok (" + rooms.size + " rooms, " + presence.size + " online)\n");
 });
 
 server.on("upgrade", (req, socket) => {

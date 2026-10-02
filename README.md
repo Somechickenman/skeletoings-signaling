@@ -103,9 +103,14 @@ JSON text messages over a WebSocket.
 
 | Direction | Message |
 |---|---|
-| player to server | `{"type":"host"}`, `{"type":"join","room":"BONE-7K2Q"}`, `{"type":"relay","to":2,"data":{...}}`, `{"type":"ping"}` |
-| server to player | `hosted`, `joined`, `peer_joined`, `peer_left`, `relay`, `host_left`, `pong`, `error` |
+| player to server | `{"type":"host"}`, `{"type":"join","room":"BONE-7K2Q"}`, `{"type":"relay","to":2,"data":{...}}`, `{"type":"ping"}`, `{"type":"presence","ver":"0.1.0"}`, `{"type":"list"}`, `{"type":"set_public","public":true,"info":{...}}` |
+| server to player | `hosted`, `joined`, `peer_joined`, `peer_left`, `relay`, `host_left`, `pong`, `online`, `rooms`, `error` |
 | error codes | `room_not_found`, `room_full`, `bad_message`, `busy`, `rate_limited` |
 
 Joiners can only message the host and the host can message any joiner, which keeps the game
 host-authoritative (a star, not a mesh).
+
+## Players online and public parties
+- Every running copy of the game sends `presence` and gets `online` (the count of copies connected). Nothing but the game version is sent.
+- A host can turn on **Public party**: the game sends `set_public` with the party's name, mode, map and phase. `list` returns public rooms that are still in the lobby and not full.
+- Presence connections that go quiet for 120 seconds are dropped (`PRESENCE_IDLE_SECONDS`, `MAX_PRESENCE`).
