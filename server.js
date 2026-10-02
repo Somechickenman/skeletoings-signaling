@@ -33,7 +33,7 @@ const MAX_MESSAGE_BYTES = parseInt(process.env.MAX_MESSAGE_BYTES || "16384", 10)
 const MAX_ROOMS = parseInt(process.env.MAX_ROOMS || "500", 10);
 const ROOM_MAX_AGE_MS = parseInt(process.env.ROOM_MAX_AGE_HOURS || "12", 10) * 3600 * 1000;
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "120", 10);       // messages per 10 s per connection
-const ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";                   // no 0/O/1/I
+const ALPHABET = "123456789ABDEFGHJKLMNPQRSTUVWXYZ";                   // no C/O/0/I (they read alike)
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 const MAX_PRESENCE = parseInt(process.env.MAX_PRESENCE || "3000", 10);
