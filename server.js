@@ -36,6 +36,7 @@ const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "120", 10);       // messa
 const ALPHABET = "123456789ABDEFGHJKLMNPQRSTUVWXYZ";                   // no C/O/0/I (they read alike)
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+const DEAD_MS = parseInt(process.env.DEAD_SECONDS || "75", 10) * 1000;      // no message and no pong for this long = connection is dead
 const MAX_PRESENCE = parseInt(process.env.MAX_PRESENCE || "3000", 10);
 const PRESENCE_IDLE_MS = parseInt(process.env.PRESENCE_IDLE_SECONDS || "120", 10) * 1000;
 const presence = new Set();    // connections that said "presence": every running copy of the game
@@ -83,6 +84,7 @@ class Client {
     this.msgTimes = [];
     this.presence = false;
     this.lastSeen = Date.now();
+    allClients.add(this);
     socket.on("data", (d) => this.onData(d));
     socket.on("close", () => this.onClose());
     socket.on("error", () => this.onClose());
@@ -152,7 +154,7 @@ class Client {
   onFrame(fin, opcode, payload) {
     if (opcode === 0x8) { this.close(1000); return; }                       // close
     if (opcode === 0x9) { this.sendFrame(0xA, payload); return; }           // ping -> pong
-    if (opcode === 0xA) return;                                             // pong
+    if (opcode === 0xA) { this.lastSeen = Date.now(); return; }             // pong: still alive
     if (opcode === 0x1 || opcode === 0x2) { this.fragOpcode = opcode; this.fragments = [payload]; }
     else if (opcode === 0x0) { this.fragments.push(payload); }
     else return;
@@ -179,6 +181,7 @@ class Client {
     if (this.closed) return;
     this.closed = true;
     this.alive = false;
+    allClients.delete(this);
     leave(this);
   }
 }
@@ -288,6 +291,12 @@ function leave(c) {
   }
 }
 
+// WebSocket ping frames every 25 s keep connections alive through idle proxies (clients answer automatically)
+const allClients = new Set();
+setInterval(() => {
+  for (const c of allClients) if (c.alive) c.sendFrame(0x9, Buffer.alloc(0));
+}, 25000).unref();
+
 // rooms never outlive their host, but also expire after a long time as a safety net
 setInterval(() => {
   const now = Date.now();
@@ -300,13 +309,17 @@ setInterval(() => {
   for (const c of presence) {
     if (now - c.lastSeen > PRESENCE_IDLE_MS) { log("presence timed out"); c.close(1000); }
   }
-}, 30000).unref();
+  // dead connections (a crashed game, a dropped network) never send a close: no pong in 75 s = gone, and its room with it
+  for (const c of allClients) {
+    if (c.alive && now - c.lastSeen > DEAD_MS) { log("dropping silent connection", c.room || (c.presence ? "(presence)" : "(none)")); c.close(1001); }
+  }
+}, 15000).unref();
 
 // ----------------------------------------------------------------------------- HTTP + upgrade
 const server = http.createServer((req, res) => {
   // health check (Render / Fly.io probes, and a human poking it with a browser)
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Skeletoings signaling server: ok (" + rooms.size + " rooms, " + presence.size + " online)\n");
+  res.end("ok\nSkeletoings signaling server (" + rooms.size + " rooms, " + presence.size + " online)\n");
 });
 
 server.on("upgrade", (req, socket) => {
