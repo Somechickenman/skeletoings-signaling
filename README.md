@@ -84,7 +84,13 @@ Fly.io has no "sleep" delay on small machines, but needs a credit card on file a
 
 Rooms always disappear as soon as their host disconnects.
 
-## TURN (only if some players can't connect)
+## The built-in relay (automatic)
+If two players cannot reach each other directly (strict routers), the joiner's game switches to the server relay after about
+12 seconds: the signaling server forwards that player's game packets (binary WebSocket messages) to the host. It needs no setup and
+no account. It adds some delay, and each relayed player is capped at roughly 300 KB/s (`RELAY_BYTES_PER_SEC`). The server only
+forwards bytes; it never reads them.
+
+## TURN (optional, only if you want direct-speed play on strict networks)
 Most players connect fine with the free Google STUN servers the game uses by default. Very strict
 networks (some schools, offices and mobile carriers) block direct connections, and the game then says
 the network may need a TURN server. A TURN server relays the traffic instead.

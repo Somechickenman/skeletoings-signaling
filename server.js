@@ -9,6 +9,9 @@
 //   client -> server   {type:"host"}                         create a room
 //                      {type:"join", room:"BONE-7K2Q"}       join a room
 //                      {type:"relay", to:<id>, data:{...}}   forward an offer/answer/candidate
+//                      {type:"relay_on"}                    joiner: the direct link failed, carry my game traffic through here
+//                      {type:"kick", id}                     host: drop a joiner
+//                      binary frame: host -> [to id u16 BE][payload]; joiner (after relay_on) -> [any 2 bytes][payload]
 //                      {type:"ping"}
 //                      {type:"presence", name, ver}          "I am online" (counts towards players online)
 //                      {type:"list"}                         ask for the public parties
@@ -20,6 +23,9 @@
 //                      {type:"peer_joined", id}              (to the host)
 //                      {type:"peer_left", id}                (to the host)
 //                      {type:"relay", from:<id>, data:{...}}
+//                      {type:"relay_ready"}                  (to the joiner after relay_on)
+//                      {type:"relay_peer", id}               (to the host: this joiner now talks through the server)
+//                      binary frame: [from id u16 BE][payload]
 //                      {type:"host_left"}                    (room is closed)
 //                      {type:"error", code}                  room_not_found | room_full | bad_message | busy | rate_limited
 //                      {type:"pong"}
@@ -29,7 +35,9 @@ const crypto = require("crypto");
 
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const MAX_PLAYERS = parseInt(process.env.MAX_PLAYERS || "8", 10);      // per room, host included
-const MAX_MESSAGE_BYTES = parseInt(process.env.MAX_MESSAGE_BYTES || "16384", 10);
+const MAX_MESSAGE_BYTES = parseInt(process.env.MAX_MESSAGE_BYTES || "16384", 10);     // text (JSON) messages
+const MAX_FRAME_BYTES = parseInt(process.env.MAX_FRAME_BYTES || "65536", 10);          // binary relay packets
+const RELAY_BYTES_PER_SEC = parseInt(process.env.RELAY_BYTES_PER_SEC || "300000", 10); // per connection
 const MAX_ROOMS = parseInt(process.env.MAX_ROOMS || "500", 10);
 const ROOM_MAX_AGE_MS = parseInt(process.env.ROOM_MAX_AGE_HOURS || "12", 10) * 3600 * 1000;
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "120", 10);       // messages per 10 s per connection
@@ -84,6 +92,9 @@ class Client {
     this.msgTimes = [];
     this.presence = false;
     this.lastSeen = Date.now();
+    this.relay = false;
+    this.byteWindow = 0;
+    this.byteCount = 0;
     allClients.add(this);
     socket.on("data", (d) => this.onData(d));
     socket.on("close", () => this.onClose());
@@ -121,7 +132,7 @@ class Client {
 
   onData(chunk) {
     this.buffer = Buffer.concat([this.buffer, chunk]);
-    if (this.buffer.length > MAX_MESSAGE_BYTES * 4) { this.close(1009); return; }
+    if (this.buffer.length > MAX_FRAME_BYTES * 4) { this.close(1009); return; }
     for (;;) {
       if (this.buffer.length < 2) return;
       const b0 = this.buffer[0], b1 = this.buffer[1];
@@ -136,10 +147,10 @@ class Client {
       } else if (len === 127) {
         if (this.buffer.length < 10) return;
         const big = this.buffer.readBigUInt64BE(2);
-        if (big > BigInt(MAX_MESSAGE_BYTES)) { this.close(1009); return; }
+        if (big > BigInt(MAX_FRAME_BYTES)) { this.close(1009); return; }
         len = Number(big); off = 10;
       }
-      if (len > MAX_MESSAGE_BYTES) { this.close(1009); return; }
+      if (len > MAX_FRAME_BYTES) { this.close(1009); return; }
       if (!masked) { this.close(1002); return; }          // client frames must be masked
       if (this.buffer.length < off + 4 + len) return;
       const mask = this.buffer.slice(off, off + 4);
@@ -161,8 +172,31 @@ class Client {
     if (!fin) return;
     const whole = Buffer.concat(this.fragments);
     this.fragments = [];
-    if (whole.length > MAX_MESSAGE_BYTES) { this.close(1009); return; }
-    if (this.fragOpcode === 0x1) this.onMessage(whole.toString("utf8"));
+    if (this.fragOpcode === 0x1) {
+      if (whole.length > MAX_MESSAGE_BYTES) { this.close(1009); return; }
+      this.onMessage(whole.toString("utf8"));
+    } else {
+      this.onBinary(whole);
+    }
+  }
+
+  // game traffic of players whose direct link failed: forwarded between the host and that joiner
+  onBinary(buf) {
+    const now = Date.now();
+    this.lastSeen = now;
+    if (now - this.byteWindow > 1000) { this.byteWindow = now; this.byteCount = 0; }
+    this.byteCount += buf.length;
+    if (this.byteCount > RELAY_BYTES_PER_SEC) return;           // over budget: drop (game traffic is lossy anyway)
+    const room = this.room ? rooms.get(this.room) : null;
+    if (!room || buf.length < 2) return;
+    let target = null;
+    if (this.isHost) target = room.peers.get(buf.readUInt16BE(0));
+    else if (this.relay) target = room.host;
+    if (!target || (!this.isHost ? false : !target.relay)) return;
+    const out = Buffer.alloc(buf.length);
+    out.writeUInt16BE(this.isHost ? 1 : this.id, 0);
+    buf.copy(out, 2, 2);
+    target.sendFrame(0x2, out);
   }
 
   onMessage(text) {
@@ -258,6 +292,22 @@ function handle(c, m) {
       else if (to === 1) target = room.host;                // joiners may only talk to the host (star topology)
       if (!target || m.data === undefined) { c.send({ type: "error", code: "bad_message" }); return; }
       target.send({ type: "relay", from: c.id, data: m.data });
+      return;
+    }
+    case "relay_on": {
+      const room = c.room ? rooms.get(c.room) : null;
+      if (!room || c.isHost) { c.send({ type: "error", code: "bad_message" }); return; }
+      c.relay = true;
+      log("peer", c.id, "switched to the server relay in", c.room);
+      c.send({ type: "relay_ready" });
+      room.host.send({ type: "relay_peer", id: c.id });
+      return;
+    }
+    case "kick": {
+      const room = c.room ? rooms.get(c.room) : null;
+      if (!room || !c.isHost) { c.send({ type: "error", code: "bad_message" }); return; }
+      const t = room.peers.get(parseInt(m.id, 10));
+      if (t) { t.room = null; room.peers.delete(t.id); t.close(1000); }
       return;
     }
     default:
