@@ -13,7 +13,7 @@
 //                      {type:"kick", id}                     host: drop a joiner
 //                      binary frame: host -> [to id u16 BE][payload]; joiner (after relay_on) -> [any 2 bytes][payload]
 //                      {type:"ping"}
-//                      {type:"presence", name, ver}          "I am online" (counts towards players online)
+//                      {type:"presence", name, ver, id}      "I am online" (counts towards players online; id = an anonymous install id, optional)
 //                      {type:"list"}                         ask for the public parties
 //                      {type:"set_public", public, info}     host: list / unlist this room, with its details
 //   server -> client   {type:"online", count}                players online (sent on presence + whenever it changes)
@@ -220,6 +220,126 @@ class Client {
   }
 }
 
+// ----------------------------------------------------------------------------- player stats (anonymous)
+// Every copy of the game may send a random install id with its presence. We keep one row per id: first seen, last seen, version,
+// number of visits. No names, no IPs. Stored in a free Turso (libSQL) database over its HTTP API when TURSO_URL + TURSO_TOKEN are
+// set (so it survives restarts); otherwise in memory only. GET /stats (with ADMIN_TOKEN) shows the numbers.
+const TURSO_URL = (process.env.TURSO_URL || "").replace(/^libsql:/, "https:").replace(/\/+$/, "");
+const TURSO_TOKEN = process.env.TURSO_TOKEN || "";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const ID_RE = /^[0-9a-f]{32}$/;
+const VISIT_GAP_S = 30 * 60;                      // reconnects inside this window are the same visit
+const memStats = new Map();                       // fallback store: id -> {first, last, ver, sessions}
+const recentIds = new Map();                      // id -> last time (s) we wrote it
+let tableReady = false;
+let statsChain = Promise.resolve();
+
+function sqlArg(v) {
+  return typeof v === "number" ? { type: "integer", value: String(Math.trunc(v)) } : { type: "text", value: String(v) };
+}
+
+async function dbExec(stmts) {
+  const body = { requests: stmts.map(([sql, args]) => ({ type: "execute", stmt: { sql, args: (args || []).map(sqlArg) } })).concat([{ type: "close" }]) };
+  const r = await fetch(TURSO_URL + "/v2/pipeline", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + TURSO_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error("turso http " + r.status);
+  const j = await r.json();
+  return j.results.slice(0, stmts.length).map((x) => {
+    if (x.type !== "ok") throw new Error("turso error " + JSON.stringify(x.error || x));
+    const res = x.response.result;
+    return (res.rows || []).map((row) => row.map((cell) => (cell.type === "integer" ? Number(cell.value) : cell.value)));
+  });
+}
+
+async function ensureTable() {
+  if (tableReady || !TURSO_URL) return;
+  await dbExec([["CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, version TEXT, sessions INTEGER NOT NULL DEFAULT 1)"]]);
+  tableReady = true;
+}
+
+function recordPlayer(id, ver) {
+  if (!ID_RE.test(id)) return;
+  const now = Math.floor(Date.now() / 1000);
+  const seen = recentIds.get(id);
+  if (seen !== undefined && now - seen < VISIT_GAP_S) return;
+  recentIds.set(id, now);
+  if (recentIds.size > 20000) recentIds.clear();
+  ver = String(ver || "").slice(0, 16);
+  const m = memStats.get(id);
+  if (m) { m.last = now; m.ver = ver; m.sessions += 1; } else { memStats.set(id, { first: now, last: now, ver, sessions: 1 }); }
+  if (!TURSO_URL || !TURSO_TOKEN) return;
+  statsChain = statsChain.then(async () => {
+    await ensureTable();
+    await dbExec([["INSERT INTO players (id, first_seen, last_seen, version, sessions) VALUES (?, ?, ?, ?, 1) ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen, version = excluded.version, sessions = sessions + 1", [id, now, now, ver]]]);
+  }).catch((e) => { log("stats write failed:", e.message); });
+}
+
+async function loadStats() {
+  const now = Math.floor(Date.now() / 1000);
+  const day = 86400;
+  if (!TURSO_URL || !TURSO_TOKEN) {
+    const rows = [...memStats.values()];
+    const by = {};
+    for (const r of rows) by[r.ver || "?"] = (by[r.ver || "?"] || 0) + 1;
+    const dayKey = (t) => new Date(t * 1000).toISOString().slice(0, 10);
+    const newPerDay = {}, activePerDay = {};
+    for (const r of rows) { newPerDay[dayKey(r.first)] = (newPerDay[dayKey(r.first)] || 0) + 1; activePerDay[dayKey(r.last)] = (activePerDay[dayKey(r.last)] || 0) + 1; }
+    return {
+      store: "memory only (set TURSO_URL and TURSO_TOKEN to keep it across restarts)",
+      total: rows.length,
+      active24h: rows.filter((r) => now - r.last < day).length,
+      active7d: rows.filter((r) => now - r.last < 7 * day).length,
+      active30d: rows.filter((r) => now - r.last < 30 * day).length,
+      versions: Object.entries(by).sort((a, b) => b[1] - a[1]),
+      newPerDay: Object.entries(newPerDay).sort().reverse().slice(0, 30),
+      activePerDay: Object.entries(activePerDay).sort().reverse().slice(0, 30),
+      recent: [...memStats.entries()].sort((a, b) => b[1].last - a[1].last).slice(0, 15).map(([id, r]) => [id.slice(0, 6), r.last, r.sessions, r.ver]),
+    };
+  }
+  await statsChain;
+  await ensureTable();
+  const [tot, a1, a7, a30, ver, np, ap, rec] = await dbExec([
+    ["SELECT COUNT(*) FROM players"],
+    ["SELECT COUNT(*) FROM players WHERE last_seen > ?", [now - day]],
+    ["SELECT COUNT(*) FROM players WHERE last_seen > ?", [now - 7 * day]],
+    ["SELECT COUNT(*) FROM players WHERE last_seen > ?", [now - 30 * day]],
+    ["SELECT COALESCE(version,'?'), COUNT(*) FROM players GROUP BY version ORDER BY 2 DESC"],
+    ["SELECT date(first_seen, 'unixepoch') d, COUNT(*) FROM players GROUP BY d ORDER BY d DESC LIMIT 30"],
+    ["SELECT date(last_seen, 'unixepoch') d, COUNT(*) FROM players GROUP BY d ORDER BY d DESC LIMIT 30"],
+    ["SELECT substr(id, 1, 6), last_seen, sessions, version FROM players ORDER BY last_seen DESC LIMIT 15"],
+  ]);
+  return { store: "Turso database", total: tot[0][0], active24h: a1[0][0], active7d: a7[0][0], active30d: a30[0][0], versions: ver, newPerDay: np, activePerDay: ap, recent: rec };
+}
+
+function statsPage(st) {
+  const esc = (x) => String(x).replace(/[&<>]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
+  const when = (t) => { const d = Math.floor(Date.now() / 1000) - t; return d < 90 ? "just now" : d < 5400 ? Math.round(d / 60) + " min ago" : d < 129600 ? Math.round(d / 3600) + " h ago" : Math.round(d / 86400) + " days ago"; };
+  const tbl = (head, rows) => "<table><tr>" + head.map((h) => "<th>" + h + "</th>").join("") + "</tr>" + rows.map((r) => "<tr>" + r.map((c) => "<td>" + esc(c) + "</td>").join("") + "</tr>").join("") + "</table>";
+  return "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Skeletoings players</title>" +
+    "<style>body{background:#0e0a14;color:#f4eddb;font:16px/1.4 system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px}h1{color:#e8c468}" +
+    ".big{display:flex;gap:12px;flex-wrap:wrap}.card{background:#1d1628;border:2px solid #8c6d2c;padding:12px 18px;min-width:120px}.card b{display:block;font-size:34px;color:#e8c468}" +
+    "table{border-collapse:collapse;margin:8px 0 20px}td,th{border:1px solid #3b3050;padding:4px 10px;text-align:left}th{color:#e8c468}small{color:#b3a9c0}</style>" +
+    "<h1>Skeletoings players</h1><div class=big>" +
+    "<div class=card><b>" + st.total + "</b>players ever</div><div class=card><b>" + st.active24h + "</b>last 24 h</div>" +
+    "<div class=card><b>" + st.active7d + "</b>last 7 days</div><div class=card><b>" + st.active30d + "</b>last 30 days</div></div>" +
+    "<h3>By version</h3>" + tbl(["Version", "Players"], st.versions) +
+    "<h3>New players per day</h3>" + tbl(["Day", "New"], st.newPerDay) +
+    "<h3>Players last seen per day</h3>" + tbl(["Day", "Players"], st.activePerDay) +
+    "<h3>Most recent (anonymous ids)</h3>" + tbl(["Id", "Last played", "Visits", "Version"], st.recent.map((r) => [r[0] + "...", when(r[1]), r[2], r[3]])) +
+    "<small>Storage: " + esc(st.store) + ". One id = one install, not one person.</small>";
+}
+
+function tokenOk(given) {
+  if (!ADMIN_TOKEN || !given) return false;
+  const a = crypto.createHash("sha256").update(String(given)).digest();
+  const b = crypto.createHash("sha256").update(ADMIN_TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 // ----------------------------------------------------------------------------- rooms
 function handle(c, m) {
   switch (m.type) {
@@ -231,6 +351,7 @@ function handle(c, m) {
       if (!presence.has(c) && presence.size >= MAX_PRESENCE) { c.send({ type: "error", code: "busy" }); return; }
       presence.add(c);
       c.presence = true;
+      if (typeof m.id === "string" && !c.counted) { c.counted = true; recordPlayer(m.id, m.ver); }
       c.send({ type: "online", count: presence.size });
       scheduleOnlineBroadcast();
       return;
@@ -367,6 +488,17 @@ setInterval(() => {
 
 // ----------------------------------------------------------------------------- HTTP + upgrade
 const server = http.createServer((req, res) => {
+  const url = new URL(req.url || "/", "http://x");
+  if (url.pathname === "/stats") {
+    const auth = (req.headers["authorization"] || "").replace(/^Bearer /, "") || url.searchParams.get("token");
+    if (!ADMIN_TOKEN) { res.writeHead(404); res.end("not found"); return; }
+    if (!tokenOk(auth)) { res.writeHead(401, { "Content-Type": "text/plain" }); res.end("unauthorized"); return; }
+    loadStats().then((st) => {
+      if (url.searchParams.get("json")) { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(st)); }
+      else { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }); res.end(statsPage(st)); }
+    }).catch((e) => { res.writeHead(500, { "Content-Type": "text/plain" }); res.end("stats failed: " + e.message); });
+    return;
+  }
   // health check (Render / Fly.io probes, and a human poking it with a browser)
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("ok\nSkeletoings signaling server (" + rooms.size + " rooms, " + presence.size + " online)\n");

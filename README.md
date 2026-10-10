@@ -120,3 +120,22 @@ host-authoritative (a star, not a mesh).
 - Every running copy of the game sends `presence` and gets `online` (the count of copies connected). Nothing but the game version is sent.
 - A host can turn on **Public party**: the game sends `set_public` with the party's name, mode, map and phase. `list` returns public rooms that are still in the lobby and not full.
 - Presence connections that go quiet for 120 seconds are dropped (`PRESENCE_IDLE_SECONDS`, `MAX_PRESENCE`).
+
+## Counting players (optional, anonymous)
+The game sends a random install id (no name, no address) with its "I am online" ping, and players can switch it off in
+Settings. The server keeps one row per id: first played, last played, version, number of visits.
+
+**Where the numbers live.** With nothing set, they live in the server's memory and vanish when Render restarts it. To keep them,
+use a free Turso database (https://turso.tech):
+1. Sign up (free plan), create a database, e.g. `skeletoings-stats`.
+2. Copy its URL (it starts with `libsql://`) and create a database token (full access).
+3. In the Render dashboard, open the signaling service, **Environment**, and add three variables:
+   - `TURSO_URL`   the `libsql://...` URL
+   - `TURSO_TOKEN` the database token
+   - `ADMIN_TOKEN` a long random password only you know (this protects the stats page)
+4. Redeploy. The table is created by the server on its first write.
+
+**Reading them.** Open `https://YOUR-SERVER/stats?token=YOUR_ADMIN_TOKEN` in a browser (or add `&json=1`, or send the token as
+an `Authorization: Bearer` header). You get players ever, active in the last 24 h / 7 days / 30 days, players by version,
+new players per day, and the most recent visits (anonymous ids). Without `ADMIN_TOKEN` the page does not exist.
+One id means one install, not one person: a reinstall counts again, and players who never go online are not seen.
