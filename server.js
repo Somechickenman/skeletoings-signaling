@@ -359,11 +359,11 @@ function handle(c, m) {
     case "list": {
       const out = [];
       for (const [code, room] of rooms) {
-        if (!room.public || !room.info || room.info.phase !== "lobby") continue;
+        if (!room.public || !room.info) continue;       // parties already in a match are listed too: joiners spectate until the next round
         const players = room.peers.size + 1;
         if (players >= MAX_PLAYERS) continue;
         out.push({ room: code, name: room.info.name, mode: room.info.mode, arena: room.info.arena,
-                   players: players, max: MAX_PLAYERS, ver: room.info.ver });
+                   players: players, max: MAX_PLAYERS, ver: room.info.ver, phase: room.info.phase });
       }
       out.sort((a, b) => b.players - a.players);
       c.send({ type: "rooms", rooms: out.slice(0, 40) });
