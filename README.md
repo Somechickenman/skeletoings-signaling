@@ -156,3 +156,22 @@ One id means one install, not one person: a reinstall counts again, and players 
   top-50 table of players by time played (name, played, online, wins, visits, last seen, version, on the boards).
 - **Test it locally:** `node tools/server_test.js` (from the game folder) starts this server on a free port and checks all of the above.
 - Without Turso it all lives in memory: names, totals and the boards are forgotten whenever the server restarts or Render puts it to sleep.
+
+## Discord accounts (0.3.1)
+
+Players can link their Discord account to their copy of the game (optional; no email, no password: Discord's own login page in the
+browser). A linked account can hold a name, appear on the leaderboards, earn event rewards, and claim the welcome gift (500 Teeth and
+the Bone Club Beret) once: once per Discord account, once per install, and only for Discord accounts at least a week old. Linking
+also checks that the player is in the Skeletoings Discord server (scope `guilds.members.read`; no bot needed).
+
+1. https://discord.com/developers/applications: **New Application**. Under **OAuth2**, copy the **Client ID**, press **Reset Secret**
+   and copy the **Client Secret**, and add the redirect `https://YOUR-SERVER/auth/discord/callback`.
+2. In Render, **Environment**, add:
+   - `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`
+   - `DISCORD_GUILD_ID` the server's id (`1555703397183782953` for Skeletoings)
+   - `PUBLIC_URL` `https://YOUR-SERVER` (no slash at the end)
+   - optional: `DISCORD_INVITE` (shown when someone isn't in the server yet), `GIFT_TEETH` (500), `GIFT_MIN_AGE_DAYS` (7)
+3. Redeploy. Tables `accounts`, `sessions` and `gift_installs` are made on first use. Without these variables, linking is off.
+
+Only names and leaderboard entries of linked accounts count. `node tools/server_test.js` covers linking (with `AUTH_TEST=1` faking
+the Discord step), the gift rules and moving an account to another install.

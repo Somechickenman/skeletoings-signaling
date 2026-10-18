@@ -390,7 +390,7 @@ const NAME_RE = /^[\p{L}\p{N} _.'-]{2,20}$/u;
 const nameIndex = new Map();                      // memory store: name key -> id
 
 function memRow(now, ver) {
-  return { first: now, last: now, ver, sessions: 1, name: "", key: "", play: 0, online: 0, wins: 0, board: 0 };
+  return { first: now, last: now, ver, sessions: 1, name: "", key: "", play: 0, online: 0, wins: 0, board: 0, discord: "" };
 }
 
 function nameBlocked(name) {
@@ -500,16 +500,17 @@ async function loadBoard(which, id) {
   if (cached && Date.now() - cached.at < BOARD_CACHE_MS) top = cached.top;
   let me = null;
   if (!TURSO_URL || !TURSO_TOKEN) {
-    const rows = [...memStats.entries()].filter(([, r]) => r.board && r.name).sort((a, b) => b[1][field] - a[1][field]);
+    const rows = [...memStats.entries()].filter(([, r]) => r.board && r.name && r.discord).sort((a, b) => b[1][field] - a[1][field]);
     if (!top) top = rows.slice(0, 10).map(([, r]) => [r.name, r[field]]);
     const mine = memStats.get(id);
-    if (mine && mine.board && mine.name) me = { rank: rows.filter(([, r]) => r[field] > mine[field]).length + 1, value: mine[field] };
+    if (mine && mine.board && mine.name && mine.discord) me = { rank: rows.filter(([, r]) => r[field] > mine[field]).length + 1, value: mine[field] };
   } else {
     await statsChain;
-    await ensureTable();
+    await ensureAccounts();
+    const linked = "board = 1 AND name IS NOT NULL AND discord_id IS NOT NULL";          // only players with a linked Discord account
     const stmts = [];
-    if (!top) stmts.push(["SELECT name, " + col + " FROM players WHERE board = 1 AND name IS NOT NULL ORDER BY " + col + " DESC, first_seen ASC LIMIT 10"]);
-    if (id) stmts.push(["SELECT " + col + ", (SELECT COUNT(*) FROM players p WHERE p.board = 1 AND p.name IS NOT NULL AND p." + col + " > players." + col + ") + 1 FROM players WHERE id = ? AND board = 1 AND name IS NOT NULL", [id]]);
+    if (!top) stmts.push(["SELECT name, " + col + " FROM players WHERE " + linked + " ORDER BY " + col + " DESC, first_seen ASC LIMIT 10"]);
+    if (id) stmts.push(["SELECT " + col + ", (SELECT COUNT(*) FROM players p WHERE p." + linked.replace(/ AND /g, " AND p.") + " AND p." + col + " > players." + col + ") + 1 FROM players WHERE id = ? AND " + linked, [id]]);
     const res = stmts.length ? await dbExec(stmts) : [];
     if (!top) top = res.shift();
     const mine = id ? res.shift() : null;
@@ -518,6 +519,172 @@ async function loadBoard(which, id) {
   boardCache.set(which, { at: cached && cached.top === top ? cached.at : Date.now(), top });
   return { top, me };
 }
+
+// ----------------------------------------------------------------------------- Discord accounts
+// Optional: a player links their Discord account to their copy of the game. No email, no password: Discord's own login page, in the
+// browser. We only ask Discord who they are (scope "identify") and whether they're in the Skeletoings server ("guilds.members.read").
+//   1. the game makes a random state (32 hex) and opens  PUBLIC_URL/auth/discord?state=...  in the browser
+//   2. that redirects to Discord; Discord sends the browser back to  /auth/discord/callback  with a one-time code
+//   3. we swap the code for a short-lived Discord token, read the user and their membership, and keep the result under the state
+//   4. the game, polling with {type: "auth_poll", state, id}, gets {type: "auth", ok, token, name}: its login token (kept in its save)
+// A linked account can hold a name, appear on the leaderboards, earn event rewards, and claim the welcome gift (500 Teeth and the
+// members' hat) once: once per Discord account AND once per install, and only for Discord accounts older than GIFT_MIN_AGE_DAYS.
+// Needs DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_GUILD_ID and PUBLIC_URL; without them linking is simply off.
+const DISCORD_ID = process.env.DISCORD_CLIENT_ID || "";
+const DISCORD_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
+const DISCORD_GUILD = process.env.DISCORD_GUILD_ID || "";
+const DISCORD_INVITE = process.env.DISCORD_INVITE || "https://discord.com/invite/cMzf7zB6GD";
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+const GIFT_TEETH = parseInt(process.env.GIFT_TEETH || "500", 10);
+const GIFT_HAT = process.env.GIFT_HAT || "member_beret";
+const GIFT_MIN_AGE_S = parseInt(process.env.GIFT_MIN_AGE_DAYS || "7", 10) * 86400;
+const AUTH_TTL_MS = 10 * 60 * 1000;
+const STATE_RE = /^[0-9a-f]{32}$/;
+const TOKEN_RE = /^[0-9a-f]{64}$/;
+const pendingAuth = new Map();                    // state -> {at, result?}
+const memAccounts = new Map();                    // discord id -> {name, stats, linked, gift}   (no Turso: tests and local runs)
+const memSessions = new Map();                    // sha256(token) -> discord id
+const memGiftInstalls = new Set();
+let accountsReady = false;
+
+function linkingOn() { return !!(DISCORD_ID && DISCORD_SECRET && DISCORD_GUILD && PUBLIC_URL); }
+function sha(t) { return crypto.createHash("sha256").update(String(t)).digest("hex"); }
+function snowflakeAge(id) {                       // seconds since the Discord account was made (the id holds its creation time)
+  try { return Math.floor(Date.now() / 1000) - Math.floor((Number(BigInt(id) >> 22n) + 1420070400000) / 1000); } catch (e) { return 0; }
+}
+
+async function ensureAccounts() {
+  if (accountsReady || !TURSO_URL) return;
+  await ensureTable();
+  await dbExec([
+    ["CREATE TABLE IF NOT EXISTS accounts (discord_id TEXT PRIMARY KEY, discord_name TEXT, stats_id TEXT, linked_at INTEGER NOT NULL, last_seen INTEGER NOT NULL, gift_at INTEGER)"],
+    ["CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, discord_id TEXT NOT NULL, created INTEGER NOT NULL)"],
+    ["CREATE TABLE IF NOT EXISTS gift_installs (stats_id TEXT PRIMARY KEY, discord_id TEXT NOT NULL, at INTEGER NOT NULL)"],
+  ]);
+  try { await dbExec([["ALTER TABLE players ADD COLUMN discord_id TEXT"]]); } catch (e) { /* already there */ }
+  accountsReady = true;
+}
+
+// Tie a Discord account to this install: the install row gets the Discord id (its name moves over from the account's old install, if
+// it had one), a new login token is made. Returns the token.
+async function linkAccount(discordId, discordName, statsId) {
+  const now = Math.floor(Date.now() / 1000);
+  const token = crypto.randomBytes(32).toString("hex");
+  if (!TURSO_URL || !TURSO_TOKEN) {
+    const a = memAccounts.get(discordId) || { name: discordName, stats: "", linked: now, gift: 0 };
+    const old = a.stats && a.stats !== statsId ? memStats.get(a.stats) : null;
+    let r = memStats.get(statsId);
+    if (!r) { r = memRow(now, ""); memStats.set(statsId, r); }
+    if (old && old.name && !r.name) { r.name = old.name; r.key = old.key; nameIndex.set(old.key, statsId); old.name = ""; old.key = ""; }
+    for (const [, x] of memStats) if (x.discord === discordId) x.discord = "";
+    r.discord = discordId;
+    a.name = discordName; a.stats = statsId;
+    memAccounts.set(discordId, a);
+    memSessions.set(sha(token), discordId);
+    boardCache.clear();
+    return token;
+  }
+  await statsChain;
+  await ensureAccounts();
+  const [prev] = await dbExec([["SELECT a.stats_id, p.name, p.name_key FROM accounts a LEFT JOIN players p ON p.id = a.stats_id WHERE a.discord_id = ?", [discordId]]]);
+  const [mine] = await dbExec([["SELECT name FROM players WHERE id = ?", [statsId]]]);
+  const stmts = [
+    ["INSERT INTO players (id, first_seen, last_seen, version, sessions) VALUES (?, ?, ?, '', 1) ON CONFLICT(id) DO NOTHING", [statsId, now, now]],
+    ["UPDATE players SET discord_id = NULL WHERE discord_id = ?", [discordId]],
+  ];
+  // the account's name comes along from its old install (unless this install already has one): free it there first, then take it here
+  if (prev.length && prev[0][0] && prev[0][0] !== statsId && prev[0][1] && !(mine.length && mine[0][0])) {
+    stmts.push(["UPDATE players SET name = NULL, name_key = NULL WHERE id = ?", [prev[0][0]]]);
+    stmts.push(["UPDATE players SET name = ?, name_key = ? WHERE id = ?", [prev[0][1], prev[0][2], statsId]]);
+  }
+  stmts.push(
+    ["UPDATE players SET discord_id = ? WHERE id = ?", [discordId, statsId]],
+    ["INSERT INTO accounts (discord_id, discord_name, stats_id, linked_at, last_seen) VALUES (?, ?, ?, ?, ?) " +
+     "ON CONFLICT(discord_id) DO UPDATE SET discord_name = excluded.discord_name, stats_id = excluded.stats_id, last_seen = excluded.last_seen",
+     [discordId, discordName, statsId, now, now]],
+    ["INSERT INTO sessions (token_hash, discord_id, created) VALUES (?, ?, ?)", [sha(token), discordId, now]],
+  );
+  await dbExec(stmts);
+  boardCache.clear();
+  return token;
+}
+
+// Who a login token belongs to: {discordId, name, gift} or null.
+async function sessionAccount(token) {
+  if (!TOKEN_RE.test(String(token || ""))) return null;
+  if (!TURSO_URL || !TURSO_TOKEN) {
+    const id = memSessions.get(sha(token));
+    const a = id ? memAccounts.get(id) : null;
+    return a ? { discordId: id, name: a.name, gift: a.gift, stats: a.stats } : null;
+  }
+  await ensureAccounts();
+  const [rows] = await dbExec([["SELECT a.discord_id, a.discord_name, a.gift_at, a.stats_id FROM sessions s JOIN accounts a ON a.discord_id = s.discord_id WHERE s.token_hash = ?", [sha(token)]]]);
+  return rows.length ? { discordId: rows[0][0], name: rows[0][1], gift: rows[0][2] || 0, stats: rows[0][3] } : null;
+}
+
+// The welcome gift: once per Discord account, once per install, Discord accounts a week old or more.
+async function claimGift(acct, statsId) {
+  if (snowflakeAge(acct.discordId) < GIFT_MIN_AGE_S) return { ok: false, reason: "too_new" };
+  const now = Math.floor(Date.now() / 1000);
+  if (!TURSO_URL || !TURSO_TOKEN) {
+    const a = memAccounts.get(acct.discordId);
+    if (!a || a.gift) return { ok: false, reason: "claimed" };
+    if (memGiftInstalls.has(statsId)) return { ok: false, reason: "install" };
+    a.gift = now;
+    memGiftInstalls.add(statsId);
+    return { ok: true, teeth: GIFT_TEETH, hat: GIFT_HAT };
+  }
+  await ensureAccounts();
+  const [mine, inst] = await dbExec([["SELECT gift_at FROM accounts WHERE discord_id = ?", [acct.discordId]], ["SELECT discord_id FROM gift_installs WHERE stats_id = ?", [statsId]]]);
+  if (!mine.length || mine[0][0]) return { ok: false, reason: "claimed" };
+  if (inst.length) return { ok: false, reason: "install" };
+  try {
+    await dbExec([["INSERT INTO gift_installs (stats_id, discord_id, at) VALUES (?, ?, ?)", [statsId, acct.discordId, now]],
+                  ["UPDATE accounts SET gift_at = ? WHERE discord_id = ? AND gift_at IS NULL", [now, acct.discordId]]]);
+  } catch (e) {
+    if (/UNIQUE/i.test(e.message)) return { ok: false, reason: "install" };
+    throw e;
+  }
+  return { ok: true, teeth: GIFT_TEETH, hat: GIFT_HAT };
+}
+
+function authPage(title, body) {
+  return "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Skeletoings</title>" +
+    "<style>body{background:#1a1423;color:#f4eddb;font:18px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;padding:16px}" +
+    "main{max-width:460px;text-align:center}h1{color:#f2d264}a{color:#8dff7a}</style></head><body><main><h1>" + title + "</h1>" + body + "</main></body></html>";
+}
+
+async function discordCallback(code, state) {
+  const p = pendingAuth.get(state);
+  if (!p) return { page: authPage("That link has expired", "<p>Go back to Skeletoings and press <b>Link Discord</b> again.</p>") };
+  const tr = await fetch("https://discord.com/api/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: DISCORD_ID, client_secret: DISCORD_SECRET, grant_type: "authorization_code", code,
+                                redirect_uri: PUBLIC_URL + "/auth/discord/callback" }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!tr.ok) throw new Error("token " + tr.status);
+  const tok = await tr.json();
+  const auth = { "Authorization": "Bearer " + tok.access_token };
+  const ur = await fetch("https://discord.com/api/v10/users/@me", { headers: auth, signal: AbortSignal.timeout(8000) });
+  if (!ur.ok) throw new Error("user " + ur.status);
+  const user = await ur.json();
+  const mr = await fetch("https://discord.com/api/v10/users/@me/guilds/" + DISCORD_GUILD + "/member", { headers: auth, signal: AbortSignal.timeout(8000) });
+  const name = clean(user.global_name || user.username, 40);
+  if (mr.status !== 200) {
+    p.result = { ok: false, reason: "not_member" };
+    return { page: authPage("Almost there, " + name + "!", "<p>Join the Skeletoings Discord server first:</p><p><a href='" + DISCORD_INVITE + "'>" + DISCORD_INVITE +
+      "</a></p><p>Then go back to the game and press <b>Link Discord</b> again.</p>") };
+  }
+  p.result = { ok: true, discordId: String(user.id), name };
+  return { page: authPage("Linked!", "<p>Welcome, <b>" + name + "</b>. You can close this tab and go back to Skeletoings.</p>") };
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [s, p] of pendingAuth) if (now - p.at > AUTH_TTL_MS) pendingAuth.delete(s);
+}, 60000).unref();
 
 // ----------------------------------------------------------------------------- rooms
 function handle(c, m) {
@@ -562,7 +729,10 @@ function handle(c, m) {
       c.claims = (c.claims || 0) + 1;
       if (c.claims > 30) { c.send({ type: "name", ok: false, reason: "busy", name: "" }); return; }
       const asked = clean(m.name, 40);
-      claimName(m.id, asked).then((r) => c.send({ type: "name", ok: r.ok, name: r.name, reason: r.reason || "", asked }))
+      sessionAccount(m.token).then((acct) => {
+        if (!acct || acct.stats !== m.id) return { ok: false, reason: "link", name: "" };        // names belong to linked Discord accounts
+        return claimName(m.id, asked);
+      }).then((r) => c.send({ type: "name", ok: r.ok, name: r.name, reason: r.reason || "", asked }))
         .catch((e) => { log("claim failed:", e.message); c.send({ type: "name", ok: false, reason: "error", name: "", asked }); });
       return;
     }
@@ -570,6 +740,49 @@ function handle(c, m) {
       if (!c.presence || typeof m.id !== "string" || !ID_RE.test(m.id)) { c.send({ type: "error", code: "bad_message" }); return; }
       if (!c.statsId) { c.statsId = m.id; c.since = Date.now(); }
       recordStats(m.id, Number(m.play_s) || 0, Number(m.wins) || 0, m.board ? 1 : 0, clean(m.ver, 16));
+      return;
+    }
+    case "auth_poll": {
+      if (!c.presence || !STATE_RE.test(String(m.state || "")) || typeof m.id !== "string" || !ID_RE.test(m.id)) { c.send({ type: "error", code: "bad_message" }); return; }
+      c.polls = (c.polls || 0) + 1;
+      if (c.polls > 400) { c.send({ type: "auth", ok: false, reason: "busy" }); return; }
+      let p = pendingAuth.get(m.state);
+      if (!p) {                                          // the game asked before the browser got here: start waiting for it
+        if (pendingAuth.size >= 5000) { c.send({ type: "auth", ok: false, reason: "busy" }); return; }
+        p = { at: Date.now() };
+        pendingAuth.set(m.state, p);
+      }
+      if (!p.result) { c.send({ type: "auth", pending: true }); return; }
+      pendingAuth.delete(m.state);
+      if (!p.result.ok) { c.send({ type: "auth", ok: false, reason: p.result.reason }); return; }
+      const res = p.result;
+      linkAccount(res.discordId, res.name, m.id)
+        .then((token) => sessionAccount(token).then((acct) => c.send({ type: "auth", ok: true, token, name: res.name, gift: !(acct && acct.gift) })))
+        .catch((e) => { log("link failed:", e.message); c.send({ type: "auth", ok: false, reason: "error" }); });
+      return;
+    }
+    case "account": {
+      if (!c.presence || typeof m.id !== "string" || !ID_RE.test(m.id)) { c.send({ type: "error", code: "bad_message" }); return; }
+      sessionAccount(m.token).then((acct) => {
+        if (!acct || acct.stats !== m.id) { c.send({ type: "account", ok: false }); return; }      // unknown, or linked to another install since
+        c.discordId = acct.discordId;
+        c.send({ type: "account", ok: true, name: acct.name, gift: !acct.gift });
+      }).catch((e) => { log("account check failed:", e.message); c.send({ type: "account", ok: false, error: true }); });
+      return;
+    }
+    case "claim_gift": {
+      if (!c.presence || typeof m.id !== "string" || !ID_RE.test(m.id)) { c.send({ type: "error", code: "bad_message" }); return; }
+      sessionAccount(m.token).then((acct) => {
+        if (!acct || acct.stats !== m.id) return { ok: false, reason: "link" };
+        return claimGift(acct, m.id);
+      }).then((r) => c.send(Object.assign({ type: "gift" }, r)))
+        .catch((e) => { log("gift failed:", e.message); c.send({ type: "gift", ok: false, reason: "error" }); });
+      return;
+    }
+    case "auth_test": {                                  // server_test.js only (AUTH_TEST=1): pretend Discord answered for this state
+      if (process.env.AUTH_TEST !== "1" || !STATE_RE.test(String(m.state || ""))) { c.send({ type: "error", code: "bad_message" }); return; }
+      pendingAuth.set(m.state, { at: Date.now(), result: m.member === false ? { ok: false, reason: "not_member" } : { ok: true, discordId: String(m.discord_id), name: clean(m.name, 40) } });
+      c.send({ type: "auth_test", ok: true });
       return;
     }
     case "board": {
@@ -703,6 +916,27 @@ const server = http.createServer((req, res) => {
       if (url.searchParams.get("json")) { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(st)); }
       else { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }); res.end(statsPage(st)); }
     }).catch((e) => { res.writeHead(500, { "Content-Type": "text/plain" }); res.end("stats failed: " + e.message); });
+    return;
+  }
+  if (url.pathname === "/auth/discord") {
+    const state = String(url.searchParams.get("state") || "");
+    const page = (code, html) => { res.writeHead(code, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }); res.end(html); };
+    if (!linkingOn()) { page(503, authPage("Not ready yet", "<p>Discord linking isn't switched on on this server yet.</p>")); return; }
+    if (!STATE_RE.test(state)) { page(400, authPage("Something's off", "<p>Go back to Skeletoings and press <b>Link Discord</b> again.</p>")); return; }
+    if (!pendingAuth.has(state) && pendingAuth.size < 5000) pendingAuth.set(state, { at: Date.now() });
+    const q = new URLSearchParams({ client_id: DISCORD_ID, response_type: "code", redirect_uri: PUBLIC_URL + "/auth/discord/callback",
+                                    scope: "identify guilds.members.read", state, prompt: "consent" });
+    res.writeHead(302, { "Location": "https://discord.com/oauth2/authorize?" + q.toString(), "Cache-Control": "no-store" });
+    res.end();
+    return;
+  }
+  if (url.pathname === "/auth/discord/callback") {
+    const page = (code, html) => { res.writeHead(code, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" }); res.end(html); };
+    const code = String(url.searchParams.get("code") || "");
+    const state = String(url.searchParams.get("state") || "");
+    if (!linkingOn() || !code || !STATE_RE.test(state)) { page(400, authPage("Not linked", "<p>You cancelled, or the link was broken. Go back to the game and try again.</p>")); return; }
+    discordCallback(code, state).then((r) => page(200, r.page))
+      .catch((e) => { log("discord callback failed:", e.message); page(502, authPage("Discord didn't answer", "<p>Try again in a minute.</p>")); });
     return;
   }
   // health check (Render / Fly.io probes, and a human poking it with a browser)
