@@ -16,8 +16,13 @@
 //                      {type:"presence", name, ver, id}      "I am online" (counts towards players online; id = an anonymous install id, optional)
 //                      {type:"list"}                         ask for the public parties
 //                      {type:"set_public", public, info}     host: list / unlist this room, with its details
+//                      {type:"claim_name", id, name}         reserve a player name for this install (after presence)
+//                      {type:"stats", id, play_s, wins, board}   this install's totals; board = 1 shows it on the leaderboards
+//                      {type:"board", which, id}             a leaderboard: which = "wins" | "play"
 //   server -> client   {type:"online", count}                players online (sent on presence + whenever it changes)
 //                      {type:"rooms", rooms:[{room,name,mode,arena,players,max,ver}]}
+//                      {type:"name", ok, name, reason}       reason: taken | blocked | bad | error
+//                      {type:"board", which, top:[[name, value]], me:{rank, value} | null}
 //                         {type:"hosted", room, id:1}
 //                      {type:"joined", room, id}             (id >= 2)
 //                      {type:"peer_joined", id}              (to the host)
@@ -235,6 +240,7 @@ let tableReady = false;
 let statsChain = Promise.resolve();
 
 function sqlArg(v) {
+  if (v === null || v === undefined) return { type: "null" };
   return typeof v === "number" ? { type: "integer", value: String(Math.trunc(v)) } : { type: "text", value: String(v) };
 }
 
@@ -255,9 +261,16 @@ async function dbExec(stmts) {
   });
 }
 
+const EXTRA_COLS = [["name", "TEXT"], ["name_key", "TEXT"], ["play_s", "INTEGER NOT NULL DEFAULT 0"], ["online_s", "INTEGER NOT NULL DEFAULT 0"],
+                    ["wins", "INTEGER NOT NULL DEFAULT 0"], ["board", "INTEGER NOT NULL DEFAULT 0"]];
+
 async function ensureTable() {
   if (tableReady || !TURSO_URL) return;
   await dbExec([["CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, version TEXT, sessions INTEGER NOT NULL DEFAULT 1)"]]);
+  for (const [col, type] of EXTRA_COLS) {
+    try { await dbExec([["ALTER TABLE players ADD COLUMN " + col + " " + type]]); } catch (e) { /* already there */ }
+  }
+  await dbExec([["CREATE UNIQUE INDEX IF NOT EXISTS players_name_key ON players(name_key)"]]);
   tableReady = true;
 }
 
@@ -270,7 +283,7 @@ function recordPlayer(id, ver) {
   if (recentIds.size > 20000) recentIds.clear();
   ver = String(ver || "").slice(0, 16);
   const m = memStats.get(id);
-  if (m) { m.last = now; m.ver = ver; m.sessions += 1; } else { memStats.set(id, { first: now, last: now, ver, sessions: 1 }); }
+  if (m) { m.last = now; m.ver = ver; m.sessions += 1; } else { memStats.set(id, memRow(now, ver)); }
   if (!TURSO_URL || !TURSO_TOKEN) return;
   statsChain = statsChain.then(async () => {
     await ensureTable();
@@ -298,11 +311,17 @@ async function loadStats() {
       newPerDay: Object.entries(newPerDay).sort().reverse().slice(0, 30),
       activePerDay: Object.entries(activePerDay).sort().reverse().slice(0, 30),
       recent: [...memStats.entries()].sort((a, b) => b[1].last - a[1].last).slice(0, 15).map(([id, r]) => [id.slice(0, 6), r.last, r.sessions, r.ver]),
+      playTotal: rows.reduce((t, r) => t + r.play, 0),
+      onlineTotal: rows.reduce((t, r) => t + r.online, 0),
+      named: rows.filter((r) => r.name).length,
+      onBoards: rows.filter((r) => r.board && r.name).length,
+      people: [...memStats.entries()].sort((a, b) => b[1].play - a[1].play).slice(0, 50)
+        .map(([id, r]) => [r.name || id.slice(0, 6) + "...", r.play, r.online, r.wins, r.sessions, r.last, r.ver, r.board ? "yes" : ""]),
     };
   }
   await statsChain;
   await ensureTable();
-  const [tot, a1, a7, a30, ver, np, ap, rec] = await dbExec([
+  const [tot, a1, a7, a30, ver, np, ap, rec, sums, ppl] = await dbExec([
     ["SELECT COUNT(*) FROM players"],
     ["SELECT COUNT(*) FROM players WHERE last_seen > ?", [now - day]],
     ["SELECT COUNT(*) FROM players WHERE last_seen > ?", [now - 7 * day]],
@@ -311,13 +330,17 @@ async function loadStats() {
     ["SELECT date(first_seen, 'unixepoch') d, COUNT(*) FROM players GROUP BY d ORDER BY d DESC LIMIT 30"],
     ["SELECT date(last_seen, 'unixepoch') d, COUNT(*) FROM players GROUP BY d ORDER BY d DESC LIMIT 30"],
     ["SELECT substr(id, 1, 6), last_seen, sessions, version FROM players ORDER BY last_seen DESC LIMIT 15"],
+    ["SELECT COALESCE(SUM(play_s), 0), COALESCE(SUM(online_s), 0), COUNT(name), SUM(CASE WHEN board = 1 AND name IS NOT NULL THEN 1 ELSE 0 END) FROM players"],
+    ["SELECT COALESCE(name, substr(id, 1, 6) || '...'), play_s, online_s, wins, sessions, last_seen, version, CASE WHEN board = 1 THEN 'yes' ELSE '' END FROM players ORDER BY play_s DESC LIMIT 50"],
   ]);
-  return { store: "Turso database", total: tot[0][0], active24h: a1[0][0], active7d: a7[0][0], active30d: a30[0][0], versions: ver, newPerDay: np, activePerDay: ap, recent: rec };
+  return { store: "Turso database", total: tot[0][0], active24h: a1[0][0], active7d: a7[0][0], active30d: a30[0][0], versions: ver, newPerDay: np, activePerDay: ap, recent: rec,
+           playTotal: sums[0][0], onlineTotal: sums[0][1], named: sums[0][2], onBoards: sums[0][3] || 0, people: ppl };
 }
 
 function statsPage(st) {
   const esc = (x) => String(x).replace(/[&<>]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
   const when = (t) => { const d = Math.floor(Date.now() / 1000) - t; return d < 90 ? "just now" : d < 5400 ? Math.round(d / 60) + " min ago" : d < 129600 ? Math.round(d / 3600) + " h ago" : Math.round(d / 86400) + " days ago"; };
+  const hours = (sec) => (Number(sec || 0) / 3600).toFixed(1);
   const tbl = (head, rows) => "<table><tr>" + head.map((h) => "<th>" + h + "</th>").join("") + "</tr>" + rows.map((r) => "<tr>" + r.map((c) => "<td>" + esc(c) + "</td>").join("") + "</tr>").join("") + "</table>";
   return "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Skeletoings players</title>" +
     "<style>body{background:#0e0a14;color:#f4eddb;font:16px/1.4 system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px}h1{color:#e8c468}" +
@@ -326,11 +349,18 @@ function statsPage(st) {
     "<h1>Skeletoings players</h1><div class=big>" +
     "<div class=card><b>" + st.total + "</b>players ever</div><div class=card><b>" + st.active24h + "</b>last 24 h</div>" +
     "<div class=card><b>" + st.active7d + "</b>last 7 days</div><div class=card><b>" + st.active30d + "</b>last 30 days</div></div>" +
+    "<div class=big style='margin-top:12px'><div class=card><b>" + hours(st.playTotal) + "</b>hours played (all players)</div>" +
+    "<div class=card><b>" + (st.total ? hours(st.playTotal / st.total) : "0") + "</b>hours per player</div>" +
+    "<div class=card><b>" + hours(st.onlineTotal) + "</b>hours online (measured here)</div>" +
+    "<div class=card><b>" + st.named + "</b>names taken</div><div class=card><b>" + st.onBoards + "</b>on the leaderboards</div></div>" +
+    "<h3>Players by time played (top 50)</h3>" + tbl(["Name", "Played", "Online", "Wins", "Visits", "Last played", "Version", "Boards"],
+      st.people.map((r) => [r[0], hours(r[1]) + " h", hours(r[2]) + " h", r[3], r[4], when(r[5]), r[6], r[7]])) +
     "<h3>By version</h3>" + tbl(["Version", "Players"], st.versions) +
     "<h3>New players per day</h3>" + tbl(["Day", "New"], st.newPerDay) +
     "<h3>Players last seen per day</h3>" + tbl(["Day", "Players"], st.activePerDay) +
     "<h3>Most recent (anonymous ids)</h3>" + tbl(["Id", "Last played", "Visits", "Version"], st.recent.map((r) => [r[0] + "...", when(r[1]), r[2], r[3]])) +
-    "<small>Storage: " + esc(st.store) + ". One id = one install, not one person.</small>";
+    "<small>Storage: " + esc(st.store) + ". One id = one install, not one person. \"Played\" is what the game counts (time it was open, also offline); " +
+    "\"Online\" is how long it was connected to this server. Names only show for players who claimed one.</small>";
 }
 
 function tokenOk(given) {
@@ -338,6 +368,155 @@ function tokenOk(given) {
   const a = crypto.createHash("sha256").update(String(given)).digest();
   const b = crypto.createHash("sha256").update(ADMIN_TOKEN).digest();
   return crypto.timingSafeEqual(a, b);
+}
+
+// ----------------------------------------------------------------------------- names, playtime, wins, leaderboards
+// One name per install, first come first served: the name's key (lower case, letters and digits only) is unique, so "Bones", "bones" and
+// "B.o.n.e.s" are the same name. A name whose owner has not been seen for NAME_EXPIRE_DAYS can be taken by someone else.
+// Names with slurs or hate terms are refused (name_filter.json, the same list the game checks as you type).
+const fs = require("fs");
+const path = require("path");
+const NAME_EXPIRE_S = parseInt(process.env.NAME_EXPIRE_DAYS || "180", 10) * 86400;
+const BOARD_CACHE_MS = 60 * 1000;
+let FILTER = { anywhere: [], word: [] };
+try { FILTER = JSON.parse(fs.readFileSync(path.join(__dirname, "name_filter.json"), "utf8")); }
+catch (e) { log("name_filter.json not found: names are only checked for length and characters"); }
+const LEET = { "0": "o", "1": "i", "2": "z", "3": "e", "4": "a", "5": "s", "6": "g", "7": "t", "8": "b", "9": "g", "@": "a", "$": "s", "!": "i", "|": "i", "+": "t" };
+const squeeze = (x) => x.replace(/(.)\1+/g, "$1");
+const deleet = (x) => x.toLowerCase().split("").map((ch) => LEET[ch] || ch).join("");
+const ANY = (FILTER.anywhere || []).map((w) => squeeze(deleet(w).replace(/[^a-z]/g, ""))).filter((w) => w.length > 0);
+const WORDS = new Set((FILTER.word || []).map((w) => w.toLowerCase()));
+const NAME_RE = /^[\p{L}\p{N} _.'-]{2,20}$/u;
+const nameIndex = new Map();                      // memory store: name key -> id
+
+function memRow(now, ver) {
+  return { first: now, last: now, ver, sessions: 1, name: "", key: "", play: 0, online: 0, wins: 0, board: 0 };
+}
+
+function nameBlocked(name) {
+  const low = name.toLowerCase();
+  const raw = low.split(/[^a-z0-9]+/).filter(Boolean);
+  const lt = deleet(low).split(/[^a-z]+/).filter(Boolean);
+  for (const t of raw.concat(lt, lt.map(squeeze))) if (WORDS.has(t)) return true;
+  const flat = squeeze(deleet(low).replace(/[^a-z]/g, ""));
+  for (const w of ANY) if (flat.includes(w)) return true;
+  return false;
+}
+
+function nameKey(name) {
+  return name.toLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+// The name as it will be kept: trimmed, single spaces. "" if it breaks the rules.
+function tidyName(name) {
+  const n = String(name || "").trim().replace(/\s+/g, " ");
+  return NAME_RE.test(n) && nameKey(n).length >= 2 ? n : "";
+}
+
+let nameChain = Promise.resolve();               // claims run one at a time, so two people can't take the same name in the same instant
+
+function claimName(id, asked) {
+  const name = tidyName(asked);
+  if (!name) return Promise.resolve({ ok: false, reason: "bad", name: "" });
+  if (nameBlocked(name)) return Promise.resolve({ ok: false, reason: "blocked", name: "" });
+  const key = nameKey(name);
+  const run = nameChain.then(() => claimNow(id, name, key));
+  nameChain = run.catch(() => {});
+  return run;
+}
+
+async function claimNow(id, name, key) {
+  const now = Math.floor(Date.now() / 1000);
+  if (!TURSO_URL || !TURSO_TOKEN) {
+    const owner = nameIndex.get(key);
+    if (owner && owner !== id) {
+      const o = memStats.get(owner);
+      if (o && now - o.last < NAME_EXPIRE_S) return { ok: false, reason: "taken", name: "" };
+      if (o) { o.name = ""; o.key = ""; }
+    }
+    let r = memStats.get(id);
+    if (!r) { r = memRow(now, ""); memStats.set(id, r); }
+    if (r.key && r.key !== key) nameIndex.delete(r.key);
+    r.name = name; r.key = key; r.last = now;
+    nameIndex.set(key, id);
+    return { ok: true, name };
+  }
+  await statsChain;
+  await ensureTable();
+  const [rows] = await dbExec([["SELECT id, last_seen FROM players WHERE name_key = ?", [key]]]);
+  if (rows.length > 0 && rows[0][0] !== id) {
+    if (now - rows[0][1] < NAME_EXPIRE_S) return { ok: false, reason: "taken", name: "" };
+    await dbExec([["UPDATE players SET name = NULL, name_key = NULL WHERE id = ?", [rows[0][0]]]]);   // long gone: the name is free again
+  }
+  try {
+    await dbExec([["INSERT INTO players (id, first_seen, last_seen, version, sessions, name, name_key) VALUES (?, ?, ?, '', 1, ?, ?) " +
+                   "ON CONFLICT(id) DO UPDATE SET name = excluded.name, name_key = excluded.name_key, last_seen = excluded.last_seen", [id, now, now, name, key]]]);
+  } catch (e) {
+    if (/UNIQUE/i.test(e.message)) return { ok: false, reason: "taken", name: "" };
+    throw e;
+  }
+  boardCache.clear();
+  return { ok: true, name };
+}
+
+// The game's own totals (it counts time played and wins in its save). Only ever goes up.
+function recordStats(id, play, wins, board, ver) {
+  play = Math.max(0, Math.min(Math.floor(play), 10 * 365 * 86400));
+  wins = Math.max(0, Math.min(Math.floor(wins), 1000000));
+  const now = Math.floor(Date.now() / 1000);
+  let r = memStats.get(id);
+  if (!r) { r = memRow(now, ver); memStats.set(id, r); }
+  r.play = Math.max(r.play, play); r.wins = Math.max(r.wins, wins); r.board = board; r.last = now;
+  boardCache.clear();
+  if (!TURSO_URL || !TURSO_TOKEN) return;
+  statsChain = statsChain.then(async () => {
+    await ensureTable();
+    await dbExec([["INSERT INTO players (id, first_seen, last_seen, version, sessions, play_s, wins, board) VALUES (?, ?, ?, ?, 1, ?, ?, ?) " +
+                   "ON CONFLICT(id) DO UPDATE SET play_s = MAX(play_s, excluded.play_s), wins = MAX(wins, excluded.wins), board = excluded.board, last_seen = excluded.last_seen",
+                   [id, now, now, ver, play, wins, board]]]);
+  }).catch((e) => { log("stats write failed:", e.message); });
+}
+
+// How long a copy of the game stayed connected (measured here, so it can't be made up).
+function addOnline(id, secs) {
+  secs = Math.max(0, Math.min(Math.floor(secs), 7 * 86400));
+  if (secs < 1) return;
+  const r = memStats.get(id);
+  if (r) r.online += secs;
+  if (!TURSO_URL || !TURSO_TOKEN) return;
+  statsChain = statsChain.then(async () => {
+    await ensureTable();
+    await dbExec([["UPDATE players SET online_s = online_s + ? WHERE id = ?", [secs, id]]]);
+  }).catch((e) => { log("online time write failed:", e.message); });
+}
+
+const boardCache = new Map();                    // which -> {at, top}
+
+async function loadBoard(which, id) {
+  const col = which === "wins" ? "wins" : "play_s";
+  const field = which === "wins" ? "wins" : "play";
+  let top;
+  const cached = boardCache.get(which);
+  if (cached && Date.now() - cached.at < BOARD_CACHE_MS) top = cached.top;
+  let me = null;
+  if (!TURSO_URL || !TURSO_TOKEN) {
+    const rows = [...memStats.entries()].filter(([, r]) => r.board && r.name).sort((a, b) => b[1][field] - a[1][field]);
+    if (!top) top = rows.slice(0, 10).map(([, r]) => [r.name, r[field]]);
+    const mine = memStats.get(id);
+    if (mine && mine.board && mine.name) me = { rank: rows.filter(([, r]) => r[field] > mine[field]).length + 1, value: mine[field] };
+  } else {
+    await statsChain;
+    await ensureTable();
+    const stmts = [];
+    if (!top) stmts.push(["SELECT name, " + col + " FROM players WHERE board = 1 AND name IS NOT NULL ORDER BY " + col + " DESC, first_seen ASC LIMIT 10"]);
+    if (id) stmts.push(["SELECT " + col + ", (SELECT COUNT(*) FROM players p WHERE p.board = 1 AND p.name IS NOT NULL AND p." + col + " > players." + col + ") + 1 FROM players WHERE id = ? AND board = 1 AND name IS NOT NULL", [id]]);
+    const res = stmts.length ? await dbExec(stmts) : [];
+    if (!top) top = res.shift();
+    const mine = id ? res.shift() : null;
+    if (mine && mine.length) me = { rank: mine[0][1], value: mine[0][0] };
+  }
+  boardCache.set(which, { at: cached && cached.top === top ? cached.at : Date.now(), top });
+  return { top, me };
 }
 
 // ----------------------------------------------------------------------------- rooms
@@ -351,7 +530,7 @@ function handle(c, m) {
       if (!presence.has(c) && presence.size >= MAX_PRESENCE) { c.send({ type: "error", code: "busy" }); return; }
       presence.add(c);
       c.presence = true;
-      if (typeof m.id === "string" && !c.counted) { c.counted = true; recordPlayer(m.id, m.ver); }
+      if (typeof m.id === "string" && !c.counted) { c.counted = true; recordPlayer(m.id, m.ver); if (ID_RE.test(m.id)) { c.statsId = m.id; c.since = Date.now(); } }
       c.send({ type: "online", count: presence.size });
       scheduleOnlineBroadcast();
       return;
@@ -376,6 +555,29 @@ function handle(c, m) {
       room.public = m.public === true;
       room.info = { name: clean(i.name, 24) || "Party", mode: clean(i.mode, 12), arena: clean(i.arena, 12),
                     phase: clean(i.phase, 8), ver: clean(i.ver, 16) };
+      return;
+    }
+    case "claim_name": {
+      if (!c.presence || typeof m.id !== "string" || !ID_RE.test(m.id)) { c.send({ type: "error", code: "bad_message" }); return; }
+      c.claims = (c.claims || 0) + 1;
+      if (c.claims > 30) { c.send({ type: "name", ok: false, reason: "busy", name: "" }); return; }
+      const asked = clean(m.name, 40);
+      claimName(m.id, asked).then((r) => c.send({ type: "name", ok: r.ok, name: r.name, reason: r.reason || "", asked }))
+        .catch((e) => { log("claim failed:", e.message); c.send({ type: "name", ok: false, reason: "error", name: "", asked }); });
+      return;
+    }
+    case "stats": {
+      if (!c.presence || typeof m.id !== "string" || !ID_RE.test(m.id)) { c.send({ type: "error", code: "bad_message" }); return; }
+      if (!c.statsId) { c.statsId = m.id; c.since = Date.now(); }
+      recordStats(m.id, Number(m.play_s) || 0, Number(m.wins) || 0, m.board ? 1 : 0, clean(m.ver, 16));
+      return;
+    }
+    case "board": {
+      const which = m.which === "wins" ? "wins" : m.which === "play" ? "play" : "";
+      if (!c.presence || !which) { c.send({ type: "error", code: "bad_message" }); return; }
+      const id = typeof m.id === "string" && ID_RE.test(m.id) ? m.id : "";
+      loadBoard(which, id).then((r) => c.send({ type: "board", which, top: r.top, me: r.me }))
+        .catch((e) => { log("board failed:", e.message); c.send({ type: "board", which, top: [], me: null, error: true }); });
       return;
     }
     case "host": {
@@ -437,6 +639,10 @@ function handle(c, m) {
 }
 
 function leave(c) {
+  if (c.statsId && c.since) {
+    addOnline(c.statsId, (Date.now() - c.since) / 1000);
+    c.since = 0;
+  }
   if (c.presence) {
     c.presence = false;
     presence.delete(c);

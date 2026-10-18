@@ -31,7 +31,7 @@ Render needs your code to live on GitHub, so we do that first.
 2. Click the **+** in the top right, then **New repository**. Name it `skeletoings-signaling`.
    Leave it **Public**. Click **Create repository**.
 3. On the new empty repo page click **uploading an existing file**.
-4. Drag the **contents** of this `server` folder into the page (`server.js`, `package.json`, `README.md`,
+4. Drag the **contents** of this `server` folder into the page (`server.js`, `name_filter.json`, `package.json`, `README.md`,
    `Dockerfile`, `fly.toml`). Not the folder itself, just the files in it.
 5. Click **Commit changes**.
 
@@ -81,6 +81,7 @@ Fly.io has no "sleep" delay on small machines, but needs a credit card on file a
 | `MAX_ROOMS` | `500` | Rooms open at once. |
 | `ROOM_MAX_AGE_HOURS` | `12` | Rooms are also removed this long after creation. |
 | `RATE_LIMIT` | `120` | Messages allowed per connection per 10 seconds. |
+| `NAME_EXPIRE_DAYS` | `180` | A claimed name whose owner hasn't been online this long can be taken by someone else. |
 
 Rooms always disappear as soon as their host disconnects.
 
@@ -109,8 +110,8 @@ JSON text messages over a WebSocket.
 
 | Direction | Message |
 |---|---|
-| player to server | `{"type":"host"}`, `{"type":"join","room":"BONE-7K2Q"}`, `{"type":"relay","to":2,"data":{...}}`, `{"type":"ping"}`, `{"type":"presence","ver":"0.1.0"}`, `{"type":"list"}`, `{"type":"set_public","public":true,"info":{...}}` |
-| server to player | `hosted`, `joined`, `peer_joined`, `peer_left`, `relay`, `host_left`, `pong`, `online`, `rooms`, `error` |
+| player to server | `{"type":"host"}`, `{"type":"join","room":"BONE-7K2Q"}`, `{"type":"relay","to":2,"data":{...}}`, `{"type":"ping"}`, `{"type":"presence","ver":"0.1.0"}`, `{"type":"list"}`, `{"type":"set_public","public":true,"info":{...}}`, `{"type":"claim_name","id","name"}`, `{"type":"stats","id","play_s","wins","board"}`, `{"type":"board","which":"wins"\|"play","id"}` |
+| server to player | `hosted`, `joined`, `peer_joined`, `peer_left`, `relay`, `host_left`, `pong`, `online`, `rooms`, `name`, `board`, `error` |
 | error codes | `room_not_found`, `room_full`, `bad_message`, `busy`, `rate_limited` |
 
 Joiners can only message the host and the host can message any joiner, which keeps the game
@@ -139,3 +140,19 @@ use a free Turso database (https://turso.tech):
 an `Authorization: Bearer` header). You get players ever, active in the last 24 h / 7 days / 30 days, players by version,
 new players per day, and the most recent visits (anonymous ids). Without `ADMIN_TOKEN` the page does not exist.
 One id means one install, not one person: a reinstall counts again, and players who never go online are not seen.
+
+## Names, time played and leaderboards
+- **Unique names.** When a player saves a name in Customize (while online), the game sends `claim_name` with its install id. The server
+  keeps one owner per name: "Bones", "bones" and "B.o.n.e.s" count as the same name. A taken name is refused and the player picks another;
+  a name changed while offline is checked on the next connection and put back if it was taken. Names left unused for `NAME_EXPIRE_DAYS`
+  become free again.
+- **Name filter.** `name_filter.json` (slurs and hate terms only; keep it identical to `data/name_filter.json` in the game). The game checks
+  as you type; the server has the final say. Upload `name_filter.json` with `server.js`, or names are only checked for length and characters.
+- **Time played and wins.** With "Share anonymous play stats" or "Show me on leaderboards" on, the game sends its own totals (`stats`) on
+  connect and every 5 minutes; they only ever go up. The server also measures how long each copy stays connected ("online" time).
+- **Leaderboards.** `board` returns the top 10 by wins or by time played, of players who turned on "Show me on leaderboards" and have a
+  claimed name, plus the asker's own rank. Cached for a minute.
+- **The stats page** (`/stats`) now also shows hours played, hours per player, hours online, names taken, players on the boards, and a
+  top-50 table of players by time played (name, played, online, wins, visits, last seen, version, on the boards).
+- **Test it locally:** `node tools/server_test.js` (from the game folder) starts this server on a free port and checks all of the above.
+- Without Turso it all lives in memory: names, totals and the boards are forgotten whenever the server restarts or Render puts it to sleep.

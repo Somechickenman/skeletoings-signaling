@@ -1,0 +1,15 @@
+{
+  "_note": "Names that are not allowed: slurs and hate terms only (swearing is fine). Keep this file identical to server/name_filter.json (tools/server_test.js checks). 'anywhere' words are matched inside the name after l33t spellings are undone, everything but letters is dropped and repeated letters are squeezed; 'word' words only as a whole word (they hide inside harmless words), checked both as typed and with l33t undone.",
+  "anywhere": [
+    "nigger", "nigga", "niggah", "nigguh", "negroid", "faggot", "faggit", "retard", "tranny", "trannie", "shemale",
+    "kike", "kyke", "chink", "wetback", "beaner", "raghead", "towelhead", "sandnigger", "porchmonkey", "junglebunny", "spearchucker",
+    "coonass", "zipperhead", "golliwog", "darkie", "jigaboo", "jiggaboo", "pickaninny", "tarbaby", "mudshark",
+    "hitler", "heilhitler", "siegheil", "nazi", "whitepower", "whitepride", "whitesupremacy", "aryannation", "kukluxklan",
+    "gaschamber", "gasthejews", "killalljews", "killthejews", "holohoax", "pedophile", "paedophile"
+  ],
+  "word": [
+    "fag", "fags", "faggy", "fagot", "spic", "spics", "spick", "coon", "coons", "gook", "gooks", "dyke", "dykes", "nig", "nigs",
+    "paki", "pakis", "wop", "wops", "kkk", "jap", "japs", "chinky", "injun", "squaw", "gyppo", "pikey", "darky",
+    "heil", "1488", "88", "pedo"
+  ]
+}
